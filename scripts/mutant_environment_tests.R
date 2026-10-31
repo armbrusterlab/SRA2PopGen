@@ -3,6 +3,7 @@
 library(dplyr)
 library(tidyr)
 library(stringr)
+library(ggplot2)
 
 run_tests <- function(breseq_mutants_file, predictions_file, outdir, terms_colname = "terms_logistic_regression", adjust = "fdr", report_all = TRUE, adjust_separately = FALSE, test_only_significant_genes = TRUE) {
     if (!dir.exists(outdir)) {
@@ -31,10 +32,12 @@ run_tests <- function(breseq_mutants_file, predictions_file, outdir, terms_colna
             delim = ", "
         )
     
-    df <- inner_join(breseq_mutants, predictions_long, by=c("source" = "run_accession"), relationship = "many-to-many") |>
+    df <- inner_join(breseq_mutants, predictions_long, by=c("source" = "run_accession"), relationship = "many-to-many")
+    
+    df <- df |>
         mutate(
             annotation = if_else(
-                str_detect(annotation, "^([A-Za-z])\\d+([A-Za-z])\\s") & !str_detect(annotation, "^([A-Za-z])\\d+\\1\\s"),
+                str_detect(annotation, "^([A-Za-z\\*])\\d+([A-Za-z\\*])\\s") & !str_detect(annotation, "^([A-Za-z\\*])\\d+\\1\\s"),
                 str_remove(annotation, "\\s.*$"),
                 annotation
             )
@@ -96,13 +99,17 @@ run_tests <- function(breseq_mutants_file, predictions_file, outdir, terms_colna
     ### Run statistical tests
     df <- df |>
         filter(!is.na(term)) # NA's would cause issues with statistical testing, and it doesn't make sense to compare these anyway
+    
+    # ensure that the fisher test function gets the full lists of terms and runs even if it's passed a subset of the data 
+    all_terms <- sort(unique(df$term))
+    all_runs  <- sort(unique(df$source))
 
     tryCatch(
         {
-            results <- test_by_gene(df, outdir, adjust = adjust, report_all = report_all) |>
+            results <- test_by_gene(df, all_terms, all_runs, outdir, adjust = adjust, report_all = report_all) |>
                 filter(significant == TRUE)
 
-            # option to reduce the number of comparisons made by only runbibg stat tests for mutants from genes which were discovered to be enriched in any terms
+            # option to reduce the number of comparisons made by only running stat tests for mutants from genes which were discovered to be enriched in any terms
             if (test_only_significant_genes) {
                 df <- df |> filter(seq_id %in% results$seq_id)
             }
@@ -113,7 +120,7 @@ run_tests <- function(breseq_mutants_file, predictions_file, outdir, terms_colna
 
     tryCatch(
         {   # now testing only on genes which passed the first test, as explained above
-            results <- test_by_mutation(df, outdir, adjust = adjust, report_all = report_all, adjust_separately = adjust_separately)
+            results <- test_by_mutation(df, all_terms, all_runs, outdir, adjust = adjust, report_all = report_all, adjust_separately = adjust_separately)
         }, 
         error = function(e) {
             writeLines(paste("Error:", e$message), file.path(outdir, "test_by_mutation_error.txt"))
@@ -122,13 +129,14 @@ run_tests <- function(breseq_mutants_file, predictions_file, outdir, terms_colna
     # test_by_mutation(df, outdir, adjust = adjust, report_all = report_all)
 }
 
-test_by_gene <- function(df, outdir, adjust="fdr", alpha=0.05, report_all = TRUE) {
-    run_fisher_2x2_tests(df, "seq_id", outdir, "stats_by_gene.tsv", adjust, alpha, report_all)
+test_by_gene <- function(df, all_terms, all_runs, outdir, adjust="fdr", alpha=0.05, report_all = TRUE) {
+    run_fisher_2x2_tests(df, "seq_id", all_terms, all_runs, outdir, "stats_by_gene", adjust, alpha, report_all)
 }
 
-test_by_mutation <- function(df, outdir, adjust="fdr", alpha=0.05, report_all = TRUE, adjust_separately = FALSE) {
+test_by_mutation <- function(df, all_terms, all_runs, outdir, adjust="fdr", alpha=0.05, report_all = TRUE, adjust_separately = FALSE) {
     df <- df |> 
         mutate(mutation = paste(seq_id, gene, annotation, sep="; "))
+
     if (adjust_separately) {
         subdir = file.path(outdir, "stats_by_mutation")
         if (!dir.exists(subdir)) {
@@ -141,17 +149,19 @@ test_by_mutation <- function(df, outdir, adjust="fdr", alpha=0.05, report_all = 
                 curr_seq = group_keys$seq_id
                 cat(curr_seq)
                 cat(group_data |> nrow())
-                run_fisher_2x2_tests(group_data, "mutation", subdir, paste0("mutations_", curr_seq, ".tsv"), adjust, alpha, report_all)
+                run_fisher_2x2_tests(group_data, "mutation", all_terms, all_runs, subdir, paste0("mutations_", curr_seq), adjust, alpha, report_all)
         })
     } else {
-        run_fisher_2x2_tests(df, "mutation", outdir, "stats_by_mutation.tsv", adjust, alpha, report_all)
+        run_fisher_2x2_tests(df, "mutation", all_terms, all_runs, outdir, "stats_by_mutation", adjust, alpha, report_all)
     }
 }
 
 # this function was written with the assistance of Copilot
-run_fisher_2x2_tests <- function(df, data_col, outdir, basename, adjust="fdr", alpha=0.05, report_all = TRUE) {
+run_fisher_2x2_tests <- function(df, data_col, terms, all_runs, outdir, basename, adjust="fdr", alpha=0.05, report_all = TRUE) {
     data_values <- sort(unique(df[[data_col]]))
-    terms <- sort(unique(df$term))
+    # terms <- sort(unique(df$term))
+
+    # all_runs <- df |> pull(source) |> unique()
 
     results <- expand.grid(
         tempname = data_values,
@@ -164,21 +174,33 @@ run_fisher_2x2_tests <- function(df, data_col, outdir, basename, adjust="fdr", a
                 current_value <- tempname
                 current_term <- term
 
-                is_value <- df[[data_col]] == current_value
-                is_term <- df$term == current_term
+                has_mutation <- df |> filter(!!sym(data_col) == current_value) |> pull(source) |> unique()
+                has_term <- df |> filter(term == current_term) |> pull(source) |> unique()
 
-                fisher.test(
-                    matrix(
+                mtx <- matrix(
                         c(
-                            sum(is_value & is_term),
-                            sum(is_value & !is_term),
-                            sum(!is_value & is_term),
-                            sum(!is_value & !is_term)
+                            length(intersect(has_mutation, has_term)),
+                            length(intersect(setdiff(all_runs, has_mutation), has_term)),
+                            length(intersect(has_mutation, setdiff(all_runs, has_term))),
+                            length(intersect(setdiff(all_runs, has_mutation), setdiff(all_runs, has_term)))
                         ),
                         nrow = 2
-                    ),
-                    alternative = "greater"
-                )$p.value
+                    )
+
+                # is_value <- df[[data_col]] == current_value
+                # is_term <- df$term == current_term
+
+                # mtx <- matrix(
+                #         c(
+                #             sum(is_value & is_term),
+                #             sum(is_value & !is_term),
+                #             sum(!is_value & is_term),
+                #             sum(!is_value & !is_term)
+                #         ),
+                #         nrow = 2
+                #     )
+
+                fisher.test(mtx, alternative = "greater")$p.value
             }
         ) |>
         ungroup() |>
@@ -193,14 +215,16 @@ run_fisher_2x2_tests <- function(df, data_col, outdir, basename, adjust="fdr", a
         results <- results |>
             filter(significant)
     }
+
+    tsv_basename <- paste0(basename, ".tsv")
     
     results |> 
-        write.table(file.path(outdir, basename), sep='\t', row.names = FALSE, quote = FALSE, na = "")
+        write.table(file.path(outdir, tsv_basename), sep='\t', row.names = FALSE, quote = FALSE, na = "")
 
     # results |> 
     #     write.table(file.path(outdir, paste0("UTF-16LE_", basename)), sep='\t', row.names = FALSE, quote = FALSE, na = "", fileEncoding = "UTF-8")
 
-    con <- file(file.path(outdir, paste0("UTF-16LE_", basename)), open = "wb")
+    con <- file(file.path(outdir, paste0("UTF-16LE_", tsv_basename)), open = "wb")
 
     writeBin(as.raw(c(0xFF, 0xFE)), con)  # UTF-16LE BOM
 
@@ -208,7 +232,7 @@ run_fisher_2x2_tests <- function(df, data_col, outdir, basename, adjust="fdr", a
 
     write.table(
         results,
-        file.path(outdir, paste0("UTF-16LE_", basename)),
+        file.path(outdir, paste0("UTF-16LE_", tsv_basename)),
         sep = "\t",
         row.names = FALSE,
         quote = FALSE,
@@ -216,6 +240,20 @@ run_fisher_2x2_tests <- function(df, data_col, outdir, basename, adjust="fdr", a
         fileEncoding = "UTF-16LE",
         append = TRUE
     )
+
+    ggplot(results, aes(!!sym(data_col), term, fill = p.adj)) +
+        geom_tile() +
+        scale_fill_gradient(low = "red", high = "white") +
+        theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+        labs(title = "Heatmap of adjusted p-values")
+    ggsave(file.path(outdir, paste0(basename, "_heatmap_adjusted.png")))
+
+    ggplot(results, aes(!!sym(data_col), term, fill = p.value)) +
+        geom_tile() +
+        scale_fill_gradient(low = "red", high = "white") +
+        theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+        labs(title = "Heatmap of pre-adjustment p-values")
+    ggsave(file.path(outdir, paste0(basename, "_heatmap.png")))
 
     return(results)
 }
