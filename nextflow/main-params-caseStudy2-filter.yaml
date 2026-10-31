@@ -20,5 +20,9 @@ filter_intergenic: "True"
 filter_synonymous: "True"
 filter_absent: "True"
 
-adjust_separately: "TRUE"
-test_only_significant_genes: "FALSE" # new addition
+# adjust_separately: "TRUE"
+# test_only_significant_genes: "FALSE"
+
+# modified for caseStudy2_main_filter3
+adjust_separately: "FALSE"
+test_only_significant_genes: "TRUE"
