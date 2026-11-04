@@ -1,5 +1,4 @@
-# sra_processing
-TODO: rename repository once name is finalized
+# SRA2PopGen
 
 # Table of contents
 - [Pipeline overview](#pipeline-overview)
