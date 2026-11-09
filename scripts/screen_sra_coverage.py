@@ -78,7 +78,8 @@ def join_data(taxdir, predictions_file, genome_length, taxid, coverage_threshold
             match = next((item for item in data[0]["tax_table"] if item["tax_id"] == taxid), None)
             num_spots = 0 if match is None else match["total_count"]
 
-        coverage = (spot_factor * num_spots * avg_length) / genome_length
+        # coverage = (spot_factor * num_spots * avg_length) / genome_length
+        coverage = (num_spots * avg_length) / genome_length # it turns out that multiplying by spot_factor is redundant because avg_length for paired end reads already has 2x baked in
         coverage_by_run[run_id] = coverage
         pass_by_run[run_id] = coverage >= coverage_threshold
         spots_by_run[run_id] = num_spots
